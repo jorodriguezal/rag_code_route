@@ -1,7 +1,7 @@
 # app.py
 import os
-import streamlit as st
 from dotenv import load_dotenv
+import streamlit as st
 
 from llama_index.core import Settings
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -9,15 +9,16 @@ from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 
 from src.indexer import build_or_load_index, reset_index
-from src.prompts import QA_SYSTEM, SUMMARY_SYSTEM
-
+from src.prompts import QA_SYSTEM
 
 load_dotenv()
 
 st.set_page_config(page_title="RAG Code de la route", page_icon="🚗", layout="wide")
-st.title(" Assistant RAG – Code de la route (PDF)")
+st.title("🚗 Assistant RAG – Code de la route (PDF)")
 
-# --- vérification env ---
+# ---------------------------
+# 1) Vérifier les variables .env
+# ---------------------------
 needed = [
     "AZURE_OPENAI_ENDPOINT",
     "AZURE_OPENAI_API_KEY",
@@ -31,153 +32,149 @@ if missing:
     st.error("Variables manquantes dans .env : " + ", ".join(missing))
     st.stop()
 
-# --- cache index ---
+# ---------------------------
+# 2) Cache index (important)
+# ---------------------------
 @st.cache_resource
 def get_index():
     return build_or_load_index()
 
+# ---------------------------
+# 3) Mémoire conversation (comme ChatGPT)
+# ---------------------------
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # liste de {"role": "user"/"assistant", "content": "...", "sources": [...]}
+
+def build_history_text(history, max_turns=6) -> str:
+    """
+    Construit un texte d'historique court pour aider le LLM
+    (sans tout envoyer pour éviter trop de tokens).
+    """
+    last = history[-2 * max_turns :]
+    lines = []
+    for m in last:
+        role = "Étudiant" if m["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {m['content']}")
+    return "\n".join(lines)
+
+# ---------------------------
+# Sidebar
+# ---------------------------
 with st.sidebar:
-    st.subheader(" Index")
-    if st.button(" Ré-indexer (reset Chroma)"):
+    st.subheader(" Paramètres")
+    top_k = st.slider("Nombre de passages récupérés (k)", 2, 12, 5)
+    cutoff = st.slider("Seuil similarité (cutoff)", 0.0, 0.6, 0.2, 0.05)
+
+    st.divider()
+
+    if st.button(" Ré-indexer (reset Chroma)", use_container_width=True):
         st.cache_resource.clear()
         reset_index()
-        st.success("Index supprimé. Relance l’app ou clique sur une action.")
+        st.success("Index supprimé  Relance une question (l'index sera reconstruit).")
         st.stop()
 
-    top_k = st.slider("Nombre de passages récupérés (k)", 2, 10, 5)
-    st.caption("Mets ton PDF dans `data/` puis pose des questions.")
+    if st.button(" Effacer la conversation", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
 
-tab1, tab2 = st.tabs([" Questions / Réponses", " Résumé"])
+    st.caption(" Mets tes PDF dans `data/` (texte sélectionnable).")
 
-# =========================
-# TAB 1 : Q&A RAG
-# =========================
-with tab1:
-    st.subheader(" Pose une question sur le Code de la route")
+# ---------------------------
+# Afficher l'historique
+# ---------------------------
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
 
-    query = st.text_input(
-        "Question",
-        placeholder="Ex: Que signifie un panneau triangulaire ?",
+        # Afficher sources si présentes (uniquement pour assistant)
+        if msg["role"] == "assistant" and msg.get("sources"):
+            with st.expander(" Sources (PDF / page / score)"):
+                for s in msg["sources"]:
+                    st.write(f"- `{s['file']}` — page **{s['page']}** — score **{s['score']}**")
+                    if s.get("excerpt"):
+                        st.caption(s["excerpt"])
+
+# ---------------------------
+# Input style ChatGPT
+# ---------------------------
+query = st.chat_input("Pose ta question sur le Code de la route...")
+
+if query:
+    # afficher message user
+    st.session_state.chat_history.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.write(query)
+
+    # Charger l'index
+    index = get_index()
+
+    # Construire le query engine (retriever + filtre)
+    retriever = VectorIndexRetriever(index=index, similarity_top_k=top_k)
+
+    query_engine = RetrieverQueryEngine(
+        retriever=retriever,
+        node_postprocessors=[SimilarityPostprocessor(similarity_cutoff=float(cutoff))],
     )
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        ask_btn = st.button("Répondre", use_container_width=True)
-    with col2:
-        show_sources = st.toggle("Afficher les sources détaillées", value=True)
+    # Injecter historique (aide pour questions du type "et après ?" / "explique mieux")
+    history_text = build_history_text(st.session_state.chat_history, max_turns=6)
 
-    if ask_btn:
-        if not query.strip():
-            st.warning("Écris une question d’abord.")
-            st.stop()
+    # Important : autoriser la reformulation à partir du contexte (pas d'invention)
+    full_query = f"""{QA_SYSTEM}
 
-        index = get_index()
+Règle supplémentaire:
+- Si la réponse n'est pas mot pour mot dans le contexte mais que le contexte contient des éléments pertinents,
+  alors reformule en t'appuyant STRICTEMENT sur ces éléments, sans ajouter d'information externe.
 
-        # Retriever + Query Engine
-        retriever = VectorIndexRetriever(index=index, similarity_top_k=top_k)
-        query_engine = RetrieverQueryEngine(
-            retriever=retriever,
-            node_postprocessors=[SimilarityPostprocessor(similarity_cutoff=0.2)],
-        )
+Historique récent (pour contexte conversationnel) :
+{history_text}
 
-        # On ajoute le "system" en préfixe au prompt via Settings.llm
-        # (LlamaIndex: on peut injecter dans le query)
-        full_query = f"{QA_SYSTEM}\n\nQuestion: {query}"
-
-        with st.spinner("Recherche dans le PDF + génération..."):
-            response = query_engine.query(full_query)
-
-        st.markdown("###  Réponse")
-        st.write(str(response))
-
-        # Sources (si disponibles)
-        if show_sources:
-            st.markdown("###  Sources")
-            try:
-                nodes = response.source_nodes or []
-            except Exception:
-                nodes = []
-
-            if not nodes:
-                st.info("Aucune source affichable (selon la réponse).")
-            else:
-                for i, n in enumerate(nodes, 1):
-                    meta = n.node.metadata or {}
-                    file_name = meta.get("file_name") or meta.get("filename") or meta.get("source") or "PDF"
-                    page = meta.get("page_label") or meta.get("page") or "?"
-                    score = getattr(n, "score", None)
-
-                    st.write(f"**[{i}]** `{file_name}` — page **{page}**" + (f" — score {score:.3f}" if score else ""))
-                    excerpt = n.node.get_text()[:700].replace("\n", " ")
-                    st.caption(excerpt + ("..." if len(n.node.get_text()) > 700 else ""))
-
-# =========================
-# TAB 2 : SUMMARY
-# =========================
-with tab2:
-    st.subheader(" Résumé (global / points clés)")
-
-    mode = st.selectbox(
-        "Type de résumé",
-        ["Résumé court", "Points clés (bullet points)", "Fiche de révision simple"],
-        index=1,
-    )
-
-    run_sum = st.button("Générer le résumé", use_container_width=True)
-
-    if run_sum:
-        index = get_index()
-
-        # Pour un résumé global, on récupère des passages "représentatifs"
-        # Astuce simple: on fait plusieurs requêtes internes puis on résume.
-        # (Simple, académique, et marche bien.)
-        seed_queries = [
-            "résume les règles importantes",
-            "signalisation panneaux marquage",
-            "priorités intersections",
-            "vitesse distance sécurité",
-            "sanctions alcool téléphone",
-        ]
-
-        retriever = VectorIndexRetriever(index=index, similarity_top_k=6)
-        collected = []
-        for q in seed_queries:
-            nodes = retriever.retrieve(q)
-            for n in nodes:
-                txt = n.node.get_text()
-                if txt and txt not in collected:
-                    collected.append(txt)
-
-        # Limiter la taille envoyée au modèle
-        joined = "\n\n".join(collected[:25])
-
-        if mode == "Résumé court":
-            instr = "Fais un résumé court (8 à 12 lignes) en français."
-        elif mode == "Fiche de révision simple":
-            instr = (
-                "Crée une fiche de révision simple: "
-                "1) Définitions, 2) Règles clés, 3) Panneaux/Signalisation (si présent), "
-                "4) Sanctions (si présent)."
-            )
-        else:
-            instr = "Donne uniquement les points clés sous forme de puces (15 à 25 puces max)."
-
-        prompt = f"""{SUMMARY_SYSTEM}
-
-Instruction: {instr}
-
-Texte à résumer (extraits du PDF):
-{joined}
-
-Sortie attendue:
-- en français
-- clair et structuré
+Question actuelle :
+{query}
 """
 
-        with st.spinner("Génération du résumé..."):
-            # Utiliser directement le LLM configuré dans Settings (déjà set dans indexer)
-            llm = Settings.llm
-            resp = llm.complete(prompt)
+    with st.chat_message("assistant"):
+        with st.spinner(" Recherche dans le PDF + génération..."):
+            response = query_engine.query(full_query)
 
-        st.markdown("###  Résumé")
-        st.write(resp.text)
+        answer = str(response)
+        st.write(answer)
+
+        # Récupérer sources
+        sources = []
+        try:
+            nodes = response.source_nodes or []
+        except Exception:
+            nodes = []
+
+        for n in nodes:
+            meta = n.node.metadata or {}
+            file_name = (
+                meta.get("file_name")
+                or meta.get("filename")
+                or meta.get("source")
+                or meta.get("document")
+                or "PDF"
+            )
+            page = meta.get("page_label") or meta.get("page") or "?"
+            score = getattr(n, "score", None)
+            score_txt = f"{score:.3f}" if isinstance(score, (int, float)) else "?"
+
+            excerpt = n.node.get_text().replace("\n", " ")
+            if len(excerpt) > 280:
+                excerpt = excerpt[:280] + "..."
+
+            sources.append(
+                {"file": file_name, "page": page, "score": score_txt, "excerpt": excerpt}
+            )
+
+        if sources:
+            with st.expander(" Sources (PDF / page / score)"):
+                for s in sources:
+                    st.write(f"- `{s['file']}` — page **{s['page']}** — score **{s['score']}**")
+                    st.caption(s["excerpt"])
+
+    # Sauvegarder dans l'historique
+    st.session_state.chat_history.append(
+        {"role": "assistant", "content": answer, "sources": sources}
+    )
