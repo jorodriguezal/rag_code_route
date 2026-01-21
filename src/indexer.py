@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import shutil
 
 import chromadb
 from llama_index.core import Settings, VectorStoreIndex, SimpleDirectoryReader
@@ -12,28 +13,31 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.llms.azure_openai import AzureOpenAI
 from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
 
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 CHROMA_DIR = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "code_route"
 
+def get_data_dir() -> Path:
+    return DATA_DIR
+
+def list_pdfs() -> list[Path]:
+    if not DATA_DIR.exists():
+        return []
+    return sorted(DATA_DIR.glob("*.pdf"))
 
 def _configure_llamaindex():
-    """Configure LlamaIndex global Settings with Azure LLM + Azure Embeddings."""
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
 
-    # Chat (GPT-4.1)
     chat_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
     chat_api_version = os.getenv("AZURE_OPENAI_API_VERSION")
 
-    # Embeddings (text-embedding-3-large)
     emb_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
     emb_api_version = os.getenv("AZURE_OPENAI_EMBEDDING_API_VERSION")
 
     llm = AzureOpenAI(
-        model="gpt-4.1",  
+        model="gpt-4.1",
         deployment_name=chat_deployment,
         azure_endpoint=endpoint,
         api_key=api_key,
@@ -49,20 +53,20 @@ def _configure_llamaindex():
         api_version=emb_api_version,
     )
 
-    # Réglages globaux LlamaIndex
     Settings.llm = llm
     Settings.embed_model = embed_model
     Settings.chunk_size = 900
     Settings.chunk_overlap = 150
 
-
 def build_or_load_index() -> VectorStoreIndex:
-    """
-    - Lit les PDF depuis data/
-    - Crée (ou recharge) un index vectoriel persisté dans Chroma
-    """
-    if not DATA_DIR.exists():
-        raise FileNotFoundError(f"Dossier data/ introuvable: {DATA_DIR}")
+    DATA_DIR.mkdir(exist_ok=True)
+
+    # Vérifier qu'on a au moins un PDF
+    pdfs = list_pdfs()
+    if not pdfs:
+        raise FileNotFoundError(
+            f"Aucun PDF dans {DATA_DIR}. Ajoute un PDF (onglet Upload) puis ré-indexe."
+        )
 
     _configure_llamaindex()
 
@@ -74,21 +78,19 @@ def build_or_load_index() -> VectorStoreIndex:
     vector_store = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # Si la collection contient déjà des embeddings, on recharge directement
-    # (Heuristique simple: count)
+    # Si collection déjà remplie -> on recharge
     try:
         existing = collection.count()
     except Exception:
         existing = 0
 
     if existing and existing > 0:
-        index = VectorStoreIndex.from_vector_store(
+        return VectorStoreIndex.from_vector_store(
             vector_store=vector_store,
             storage_context=storage_context,
         )
-        return index
 
-    # Sinon, on indexe les PDF
+    # Sinon on indexe les PDF présents dans data/
     documents = SimpleDirectoryReader(
         input_dir=str(DATA_DIR),
         recursive=False,
@@ -102,15 +104,7 @@ def build_or_load_index() -> VectorStoreIndex:
     )
     return index
 
-
 def reset_index():
-    """Supprime la base Chroma locale pour forcer une ré-indexation propre."""
+    """Supprime complètement la base Chroma locale (force rebuild)."""
     if CHROMA_DIR.exists():
-        # supprime tout le dossier
-        for p in CHROMA_DIR.rglob("*"):
-            if p.is_file():
-                p.unlink()
-        for p in sorted(CHROMA_DIR.rglob("*"), reverse=True):
-            if p.is_dir():
-                p.rmdir()
-        CHROMA_DIR.rmdir()
+        shutil.rmtree(CHROMA_DIR, ignore_errors=True)
